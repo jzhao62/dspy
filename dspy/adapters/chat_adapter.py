@@ -4,19 +4,22 @@ import json
 import re
 import textwrap
 from collections.abc import Mapping
-from itertools import chain
-from typing import Any, Dict, Literal, NamedTuple
+from typing import Any, Dict, Literal, NamedTuple, Optional, Type
 
 import pydantic
+from litellm import ContextWindowExceededError
 from pydantic.fields import FieldInfo
 
 from dspy.adapters.base import Adapter
-from dspy.adapters.types.image import try_expand_image_tags
+from dspy.adapters.json_adapter import JSONAdapter
 from dspy.adapters.types.history import History
+from dspy.adapters.types.image import try_expand_image_tags
 from dspy.adapters.utils import format_field_value, get_annotation_name, parse_value
+from dspy.clients.lm import LM
 from dspy.signatures.field import OutputField
 from dspy.signatures.signature import Signature, SignatureMeta
 from dspy.signatures.utils import get_dspy_field_type
+from dspy.utils.callback import BaseCallback
 
 field_header_pattern = re.compile(r"\[\[ ## (\w+) ## \]\]")
 
@@ -31,7 +34,29 @@ BuiltInCompletedOutputFieldInfo = FieldInfoWithName(name="completed", info=Outpu
 
 
 class ChatAdapter(Adapter):
-    def format(self, signature: Signature, demos: list[dict[str, Any]], inputs: dict[str, Any]) -> list[dict[str, Any]]:
+    def __init__(self, callbacks: Optional[list[BaseCallback]] = None):
+        super().__init__(callbacks)
+
+    def __call__(
+        self,
+        lm: LM,
+        lm_kwargs: dict[str, Any],
+        signature: Type[Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        try:
+            return super().__call__(lm, lm_kwargs, signature, demos, inputs)
+        except Exception as e:
+            if isinstance(e, ContextWindowExceededError):
+                # On context window exceeded error, we don't want to retry with a different adapter.
+                raise e
+            # fallback to JSONAdapter
+            return JSONAdapter()(lm, lm_kwargs, signature, demos, inputs)
+
+    def format(
+        self, signature: Type[Signature], demos: list[dict[str, Any]], inputs: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
 
         # Extract demos where some of the output_fields are not filled in.
@@ -64,13 +89,16 @@ class ChatAdapter(Adapter):
         messages = try_expand_image_tags(messages)
         return messages
 
-    def parse(self, signature, completion):
+    def parse(self, signature: Type[Signature], completion: str) -> dict[str, Any]:
         sections = [(None, [])]
 
         for line in completion.splitlines():
             match = field_header_pattern.match(line.strip())
             if match:
-                sections.append((match.group(1), []))
+                # If the header pattern is found, split the rest of the line as content
+                header = match.group(1)
+                remaining_content = line[match.end() :].strip()
+                sections.append((header, [remaining_content] if remaining_content else []))
             else:
                 sections[-1][1].append(line)
 
@@ -92,7 +120,9 @@ class ChatAdapter(Adapter):
         return fields
 
     # TODO(PR): Looks ok?
-    def format_finetune_data(self, signature, demos, inputs, outputs):
+    def format_finetune_data(
+        self, signature: Type[Signature], demos: list[dict[str, Any]], inputs: dict[str, Any], outputs: dict[str, Any]
+    ) -> dict[str, list[Any]]:
         # Get system + user messages
         messages = self.format(signature, demos, inputs)
 
@@ -105,7 +135,7 @@ class ChatAdapter(Adapter):
         # Wrap the messages in a dictionary with a "messages" key
         return dict(messages=messages)
 
-    def format_fields(self, signature, values, role):
+    def format_fields(self, signature: Type[Signature], values: dict[str, Any], role: str) -> str:
         fields_with_values = {
             FieldInfoWithName(name=field_name, info=field_info): values.get(
                 field_name, "Not supplied for this particular example."
@@ -115,7 +145,14 @@ class ChatAdapter(Adapter):
         }
         return format_fields(fields_with_values)
 
-    def format_turn(self, signature, values, role, incomplete=False, is_conversation_history=False):
+    def format_turn(
+        self,
+        signature: Type[Signature],
+        values: dict[str, Any],
+        role: str,
+        incomplete: bool = False,
+        is_conversation_history: bool = False,
+    ) -> dict[str, Any]:
         return format_turn(signature, values, role, incomplete, is_conversation_history)
 
 
@@ -139,7 +176,9 @@ def format_fields(fields_with_values: Dict[FieldInfoWithName, Any]) -> str:
     return "\n\n".join(output).strip()
 
 
-def format_turn(signature, values, role, incomplete=False, is_conversation_history=False):
+def format_turn(
+    signature: Type[Signature], values: dict[str, Any], role: str, incomplete=False, is_conversation_history=False
+):
     """
     Constructs a new message ("turn") to append to a chat thread. The message is carefully formatted
     so that it can instruct an LLM to generate responses conforming to the specified DSPy signature.
@@ -212,18 +251,15 @@ def format_turn(signature, values, role, incomplete=False, is_conversation_histo
     return {"role": role, "content": joined_messages}
 
 
-def flatten_messages(messages):
-    """Flatten nested message lists."""
-    return list(chain.from_iterable(item if isinstance(item, list) else [item] for item in messages))
-
-
 def enumerate_fields(fields: dict) -> str:
     parts = []
     for idx, (k, v) in enumerate(fields.items()):
         parts.append(f"{idx + 1}. `{k}`")
         parts[-1] += f" ({get_annotation_name(v.annotation)})"
         parts[-1] += f": {v.json_schema_extra['desc']}" if v.json_schema_extra["desc"] != f"${{{k}}}" else ""
-
+        parts[-1] += (
+            f"\nConstraints: {v.json_schema_extra['constraints']}" if v.json_schema_extra.get("constraints") else ""
+        )
     return "\n".join(parts).strip()
 
 
